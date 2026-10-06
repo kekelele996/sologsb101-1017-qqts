@@ -220,6 +220,15 @@ function handleFilterChange(key: string, value: string): void {
         <el-table-column label="料液批次" min-width="220">
           <template #default="{ row }">{{ batchLabel[row.batchId] ?? '（批次已删除）' }}</template>
         </el-table-column>
+        <el-table-column label="扣料量" width="110" align="right">
+          <template #default="{ row }">
+            <span v-if="row.consumedAt !== ''">
+              {{ row.consumedKg }} kg
+              <span v-if="row.actualKg !== null" class="cell-sub">（实 {{ row.actualKg }}）</span>
+            </span>
+            <span v-else class="cell-sub">未扣料</span>
+          </template>
+        </el-table-column>
         <el-table-column label="设计高度" width="110" align="right">
           <template #default="{ row }">{{ row.designHeightMm }} mm</template>
         </el-table-column>

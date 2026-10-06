@@ -75,7 +75,7 @@ sologsb101-1017/
         ├── hooks/              # useStepProgress.ts useIdbTable.ts
         ├── pages/              # 5 个模块页面
         ├── router/index.ts     # 路由表 + ROUTES 常量
-        └── utils/              # thermal.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # thermal.ts db.ts export.ts settings.ts id.ts
 ```
 
 ---
@@ -100,13 +100,14 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**为 `Piece` 补齐取料扣减字段**（`actualKg` / `consumedKg` / `consumedAt`），历史作品默认未扣减。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -165,3 +166,7 @@ npm run preview      # 预览 dist 产物
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
   判定不合格时生成返工提示，**原始工序记录完整保留**。
 * **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。
+* **取料工序联动扣减**：作品登记时挑选料液批次，「取料」工序推进到「已完成」时按件扣减该批次剩余量，并回写作品的 `consumedKg` / `consumedAt`。扣减方式可在料液页切换：
+  * **系统估料**（默认）：按设计高度与壁厚估算单件用料（薄壁圆柱壳模型，外径≈高度×0.6，玻璃密度 2.5e-6 kg/mm³），取料完成直接扣减；
+  * **实际取料**：操作工必须在取料工序里填实际取料量，未填则拦下不允许推进完成。
+  * 作品未挂批次、或实际模式下未填取料量时，拦下不扣不推进；剩料不足时扣到 0 并提示补料；已扣减过的作品不重复扣减。

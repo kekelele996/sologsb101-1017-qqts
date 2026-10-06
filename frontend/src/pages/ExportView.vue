@@ -221,7 +221,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         :suffix="`· ${DB_NAME}`"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+        hint="IndexedDB 库名与结构版本；v3 为 Piece 补齐取料扣减字段（actualKg / consumedKg / consumedAt）"
       />
     </div>
 

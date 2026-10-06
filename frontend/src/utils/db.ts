@@ -19,10 +19,10 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -46,7 +46,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -91,6 +91,26 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：Piece 补齐取料扣减字段（actualKg / consumedKg / consumedAt） ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 6：作品补齐取料扣减字段，历史数据默认未扣减
+        await tx.table('pieces').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.actualKg === undefined || row.actualKg === null) row.actualKg = null
+          if (typeof row.consumedKg !== 'number') row.consumedKg = 0
+          if (typeof row.consumedAt !== 'string') row.consumedAt = ''
+          row.revision = ROW_REVISION
         })
       })
   }
@@ -160,6 +180,51 @@ export async function consumeBatch(batchId: string, kg: number): Promise<number>
   const actual = Math.max(0, Math.min(batch.remainKg, kg))
   await db.batches.update(batchId, { remainKg: Math.round((batch.remainKg - actual) * 10) / 10, updatedAt: nowIso() })
   return actual
+}
+
+/** 取料扣减结果 */
+export interface ConsumeForPieceResult {
+  /** 实际扣减量（不足时为扣到 0 的量） */
+  deductedKg: number
+  /** 扣减后批次剩余量 */
+  remainKg: number
+  /** 批次色号（用于提示） */
+  batchColorCode: string
+}
+
+/**
+ * 取料工序完成时扣减料液批次并回写作品扣减记录（同一事务）。
+ * - 幂等：作品已扣减过（consumedAt 非空）则不重复扣，直接返回既有记录。
+ * - 不足时扣到 0，consumedKg 记录实际扣减量。
+ * - 作品未挂批次或批次不存在时返回 0，由调用方决定是否拦下。
+ */
+export async function consumeForPiece(pieceId: string, kg: number): Promise<ConsumeForPieceResult> {
+  return await db.transaction('rw', db.pieces, db.batches, async () => {
+    const piece = await db.pieces.get(pieceId)
+    if (!piece) return { deductedKg: 0, remainKg: 0, batchColorCode: '' }
+    if (piece.consumedAt !== '') {
+      // 已扣减过，不重复扣
+      const existing = piece.batchId ? await db.batches.get(piece.batchId) : undefined
+      return {
+        deductedKg: piece.consumedKg,
+        remainKg: existing?.remainKg ?? 0,
+        batchColorCode: existing?.colorCode ?? '',
+      }
+    }
+    if (!piece.batchId) return { deductedKg: 0, remainKg: 0, batchColorCode: '' }
+    const batch = await db.batches.get(piece.batchId)
+    if (!batch) return { deductedKg: 0, remainKg: 0, batchColorCode: '' }
+    const deducted = Math.max(0, Math.min(batch.remainKg, kg))
+    const remain = Math.round((batch.remainKg - deducted) * 10) / 10
+    await db.batches.update(batch.id, { remainKg: remain, updatedAt: nowIso() })
+    await db.pieces.update(pieceId, {
+      consumedKg: deducted,
+      consumedAt: nowIso(),
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    })
+    return { deductedKg: deducted, remainKg: remain, batchColorCode: batch.colorCode }
+  })
 }
 
 /* -------------------------------- 作品 -------------------------------- */

@@ -31,6 +31,12 @@ export interface Piece {
   artist: string
   /** 作品状态 */
   state: PieceState
+  /** 操作工实际取料量（kg）；null 表示按系统估料扣减 */
+  actualKg: number | null
+  /** 取料工序完成时实际从料液批次扣减的数量（kg）；0 表示尚未扣减 */
+  consumedKg: number
+  /** 扣减时间（ISO）；空串表示尚未扣减 */
+  consumedAt: string
   createdAt: string
   updatedAt: string
   revision: number

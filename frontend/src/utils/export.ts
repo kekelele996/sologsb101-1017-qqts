@@ -94,6 +94,7 @@ export function buildScheduleCsv(
     '壁厚(mm)',
     '料液色号',
     '所属窑炉',
+    '扣料量(kg)',
     '工序数',
     '已完成工序',
     '累计工时(分钟)',
@@ -123,6 +124,7 @@ export function buildScheduleCsv(
         piece.wallThicknessMm,
         batch?.colorCode ?? '—',
         furnace?.code ?? '—',
+        piece.consumedAt === '' ? '—' : piece.consumedKg,
         pieceSteps.length,
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
@@ -179,6 +181,11 @@ export function buildStepCardText(
   lines.push(`【工序卡片】${piece.name}（${piece.craft} · ${piece.artist} · ${piece.state}）`)
   lines.push(`设计尺寸：高 ${piece.designHeightMm} mm / 壁厚 ${piece.wallThicknessMm} mm`)
   lines.push(`料液：${batch === undefined ? '未关联' : `${batch.colorCode}（${batch.recipe}）`} · 窑炉 ${furnace?.code ?? '—'}`)
+  lines.push(
+    `扣料：${piece.consumedAt === '' ? '未扣料' : `${piece.consumedKg} kg`}${
+      piece.actualKg === null ? '' : ` · 实际取料 ${piece.actualKg} kg`
+    }`,
+  )
   lines.push(
     `理论退火时长：${formatHours(totalAnnealHours(piece.wallThicknessMm))}（升温 ${formatHours(
       segmentHours('升温', piece.wallThicknessMm),

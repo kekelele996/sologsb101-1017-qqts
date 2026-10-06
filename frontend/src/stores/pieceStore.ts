@@ -10,6 +10,7 @@ import type { Step, StepDraft } from '../types/step'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
+  consumeForPiece,
   countAll,
   db,
   initDatabase,
@@ -21,6 +22,8 @@ import {
   syncPieceState,
 } from '../utils/db'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
+import { consumeMode } from '../utils/settings'
+import { estPieceKg } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
 /** 作品筛选条件 */
@@ -156,6 +159,9 @@ export const usePieceStore = defineStore('piece', () => {
       craft: draft.craft,
       artist: draft.artist.trim(),
       state: draft.state,
+      actualKg: null,
+      consumedKg: 0,
+      consumedAt: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -180,6 +186,14 @@ export const usePieceStore = defineStore('piece', () => {
       artist: draft.artist.trim(),
       state: draft.state,
     })
+    revision.value += 1
+  }
+
+  /** 设置操作工实际取料量（kg）；null 表示改回按系统估料扣减 */
+  async function setActualKg(pieceId: string, kg: number | null): Promise<void> {
+    const existing = pieces.value.find((row) => row.id === pieceId)
+    if (existing === undefined) return
+    await putPiece({ ...existing, actualKg: kg })
     revision.value += 1
   }
 
@@ -236,7 +250,7 @@ export const usePieceStore = defineStore('piece', () => {
     lastMessage.value = '工序已删除，作品状态已重新推导'
   }
 
-  /** 推进工序状态：未开始 → 进行中 → 已完成 */
+  /** 推进工序状态：未开始 → 进行中 → 已完成；取料完成时按件扣减料液批次 */
   async function advanceStep(stepId: string): Promise<void> {
     const existing = steps.value.find((row) => row.id === stepId)
     if (existing === undefined) return
@@ -247,6 +261,49 @@ export const usePieceStore = defineStore('piece', () => {
       return
     }
     const next = flow[index + 1]
+
+    // 取料工序推进到「已完成」：按件扣减所挂料液批次
+    if (existing.name === '取料' && next === '已完成') {
+      const piece = pieces.value.find((row) => row.id === existing.pieceId)
+      if (piece === undefined) {
+        lastMessage.value = '未找到作品，无法扣减料液'
+        return
+      }
+      // 已扣减过：不重复扣，直接推进
+      if (piece.consumedAt !== '') {
+        await putStep({ ...existing, state: next })
+        revision.value += 1
+        lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已推进为「${next}」（该作品已扣减过料液，不重复扣减）`
+        return
+      }
+      // 未挂批次：拦下，不扣不推进
+      if (!piece.batchId) {
+        lastMessage.value = '该作品未挂料液批次，无法扣减料液；请先在作品登记中选择料液批次'
+        return
+      }
+      // 确定扣减量：实际模式取操作工填的量，估料模式取系统估算
+      let amount: number
+      if (consumeMode.value === 'actual') {
+        if (piece.actualKg === null || piece.actualKg <= 0) {
+          lastMessage.value = '请先在取料工序中填写实际取料量，再推进完成'
+          return
+        }
+        amount = piece.actualKg
+      } else {
+        amount = estPieceKg(piece.designHeightMm, piece.wallThicknessMm)
+      }
+      const result = await consumeForPiece(piece.id, amount)
+      await putStep({ ...existing, state: next })
+      revision.value += 1
+      const shortfall = Math.round((amount - result.deductedKg) * 10) / 10
+      if (shortfall > 0) {
+        lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已完成：从 ${result.batchColorCode} 扣料 ${result.deductedKg} kg（需 ${amount} kg，剩料不足已扣至 0，还差 ${shortfall} kg，请补料）`
+      } else {
+        lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已完成：从 ${result.batchColorCode} 扣料 ${result.deductedKg} kg，剩余 ${result.remainKg} kg`
+      }
+      return
+    }
+
     await putStep({ ...existing, state: next })
     revision.value += 1
     const piece = pieces.value.find((row) => row.id === existing.pieceId)
@@ -316,6 +373,7 @@ export const usePieceStore = defineStore('piece', () => {
     resetFilters,
     createPiece,
     updatePiece,
+    setActualKg,
     deletePiece,
     createStep,
     updateStep,

@@ -219,3 +219,23 @@ export const LOW_REMAIN_KG = 60
 export function isLowRemain(remainKg: number): boolean {
   return remainKg < LOW_REMAIN_KG
 }
+
+/** 玻璃密度（kg/mm³）：钠钙玻璃约 2.5 g/cm³ = 2.5e-6 kg/mm³ */
+export const GLASS_DENSITY_KG_PER_MM3 = 2.5e-6
+
+/** 单件用料估算的外径/高度比（假设直径约为高度的 60%） */
+export const EST_DIAMETER_RATIO = 0.6
+
+/**
+ * 估算单件用料（kg）：把作品近似为薄壁圆柱壳（侧壁 + 底），
+ * 外径按设计高度的 60% 估算，玻璃体积 × 密度即单件质量。
+ * 用于「系统估料」模式下取料工序完成时直接扣减料液批次。
+ */
+export function estPieceKg(designHeightMm: number, wallThicknessMm: number): number {
+  const H = Math.max(1, designHeightMm)
+  const W = Math.max(0.5, wallThicknessMm)
+  const D = H * EST_DIAMETER_RATIO
+  const lateral = Math.PI * (D - W) * H * W
+  const base = (Math.PI / 4) * (D - W) ** 2 * W
+  return round2((lateral + base) * GLASS_DENSITY_KG_PER_MM3)
+}

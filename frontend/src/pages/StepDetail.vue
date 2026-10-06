@@ -14,8 +14,9 @@ import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
+import { consumeMode } from '@/utils/settings'
 import { buildStepCardText, copyText } from '@/utils/export'
-import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
+import { CRAFT_TEMP_RANGE, checkStepTemp, estPieceKg, formatHours, totalAnnealHours } from '@/utils/thermal'
 
 const route = useRoute()
 const router = useRouter()
@@ -44,6 +45,9 @@ const form = reactive<StepDraft>({
   state: '未开始',
 })
 
+/** 取料工序的实际取料量（kg）；null 表示不填，按系统估料扣减 */
+const formActualKg = ref<number | null>(null)
+
 const rules: FormRules<StepDraft> = {
   seq: [{ required: true, message: '请填写工序序号', trigger: 'blur' }],
   name: [{ required: true, message: '请选择工序名称', trigger: 'change' }],
@@ -54,6 +58,11 @@ const rules: FormRules<StepDraft> = {
 }
 
 const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
+
+/** 系统估算单件用料（kg）：按设计高度与壁厚估算 */
+const estKg = computed<number>(() =>
+  piece.value === null ? 0 : estPieceKg(piece.value.designHeightMm, piece.value.wallThicknessMm)
+)
 
 const batch = computed(() =>
   piece.value === null ? undefined : furnaceStore.batches.find((row) => row.id === piece.value?.batchId)
@@ -88,6 +97,7 @@ function openCreate(): void {
     remark: '',
     state: '未开始' as StepState,
   })
+  formActualKg.value = piece.value?.actualKg ?? null
   dialogVisible.value = true
 }
 
@@ -103,6 +113,7 @@ function openEdit(row: Step): void {
     remark: row.remark,
     state: row.state,
   })
+  formActualKg.value = row.name === '取料' ? piece.value?.actualKg ?? null : null
   dialogVisible.value = true
 }
 
@@ -121,6 +132,10 @@ async function handleSubmit(): Promise<void> {
     } else {
       await pieceStore.updateStep(editingId.value, { ...form })
       ElMessage.success('工序已更新')
+    }
+    // 取料工序：同步操作工实际取料量（null 表示按系统估料扣减）
+    if (form.name === '取料' && piece.value !== null) {
+      await pieceStore.setActualKg(piece.value.id, formActualKg.value)
     }
     dialogVisible.value = false
   } finally {
@@ -143,6 +158,35 @@ async function handleDelete(row: Step): Promise<void> {
 }
 
 async function handleAdvance(row: Step): Promise<void> {
+  // 取料工序推进到「已完成」前：先校验作品是否挂了料液批次
+  if (row.name === '取料' && row.state === '进行中') {
+    const target = piece.value
+    if (target !== null && !target.batchId) {
+      ElMessage.warning('该作品未挂料液批次，无法扣减料液；请先在作品登记中选择料液批次')
+      return
+    }
+  }
+  // 取料工序推进到「已完成」前：实际取料模式下若未填实际取料量，先弹出填写
+  if (row.name === '取料' && row.state === '进行中') {
+    const target = piece.value
+    if (target !== null && consumeMode.value === 'actual' && (target.actualKg === null || target.actualKg <= 0)) {
+      try {
+        const { value } = await ElMessageBox.prompt('请填写实际取料量（kg），填写后将按此数扣减料液批次', '实际取料量', {
+          confirmButtonText: '确认并推进',
+          cancelButtonText: '取消',
+          inputType: 'number',
+          inputValue: String(target.actualKg ?? estKg.value),
+          inputValidator: (v: string) => {
+            const n = Number(v)
+            return (Number.isFinite(n) && n > 0) || '请填写大于 0 的数字'
+          },
+        })
+        await pieceStore.setActualKg(target.id, Number(value))
+      } catch {
+        return // 用户取消，不推进
+      }
+    }
+  }
   await pieceStore.advanceStep(row.id)
   ElMessage.success(pieceStore.lastMessage)
 }
@@ -185,6 +229,7 @@ function goAnnealing(): void {
           <StageTag v-if="piece" :stage="piece.state" :craft="piece.craft" />
           <el-tag v-if="furnace" type="info">{{ furnace.code }} · 上限 {{ furnace.maxTempC }} ℃</el-tag>
           <el-tag v-if="batch" type="success">{{ batch.colorCode }} · 余 {{ batch.remainKg }} kg</el-tag>
+          <el-tag v-if="piece && piece.consumedAt !== ''" type="warning">已扣 {{ piece.consumedKg }} kg</el-tag>
           <el-tag v-if="piece" type="warning">理论退火 {{ formatHours(totalAnnealHours(piece.wallThicknessMm)) }}</el-tag>
         </el-space>
       </template>
@@ -297,6 +342,21 @@ function goAnnealing(): void {
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
               </div>
+              <div v-if="row.name === '取料' && piece !== null" class="step-material">
+                <template v-if="piece.consumedAt !== ''">
+                  <el-tag size="small" type="success">已扣料 {{ piece.consumedKg }} kg</el-tag>
+                  <span class="cell-sub">{{ piece.consumedAt }} 扣减</span>
+                  <span v-if="piece.actualKg !== null" class="cell-sub">· 实际取料 {{ piece.actualKg }} kg</span>
+                </template>
+                <template v-else>
+                  <el-tag size="small" type="info">
+                    {{ consumeMode === 'actual' ? '待填实际取料量' : `预计 ${estKg} kg` }}
+                  </el-tag>
+                  <span class="cell-sub">
+                    {{ consumeMode === 'actual' ? '取料完成时按填写量扣减' : '取料完成时按系统估料扣减' }}
+                  </span>
+                </template>
+              </div>
             </div>
             <div class="step-actions">
               <el-button
@@ -358,6 +418,20 @@ function goAnnealing(): void {
         </el-row>
         <el-form-item label="备注">
           <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="如：分三次吹气成型 / 夹持颈部收细" />
+        </el-form-item>
+        <el-form-item v-if="form.name === '取料'" label="实际取料量">
+          <el-input-number
+            v-model="formActualKg"
+            :min="0.1"
+            :max="500"
+            :step="0.5"
+            :precision="1"
+            style="width: 100%"
+            placeholder="不填则按系统估料扣减"
+          />
+          <div class="form-tip">
+            {{ consumeMode === 'actual' ? '当前为「实际取料」模式，取料完成前必须填写，否则无法推进。' : `不填则按系统估料 ${estKg} kg 扣减；填写后按此数扣减。` }}
+          </div>
         </el-form-item>
         <el-alert
           :type="tempCheck.ok ? 'success' : 'warning'"
@@ -465,6 +539,26 @@ function goAnnealing(): void {
 .step-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.step-material {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.cell-sub {
+  font-size: 12px;
+  color: #8b95a1;
+}
+
+.form-tip {
+  font-size: 12px;
+  color: #8b95a1;
+  line-height: 1.6;
+  margin-top: 4px;
 }
 
 .step-actions {

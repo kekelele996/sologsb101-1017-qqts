@@ -22,6 +22,7 @@ import {
   type FurnaceType,
 } from '@/types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '@/types/batch'
+import { consumeMode, CONSUME_MODE_OPTIONS, setConsumeMode, type ConsumeMode } from '@/utils/settings'
 import { LOW_REMAIN_KG, isLowRemain } from '@/utils/thermal'
 import { today } from '@/utils/id'
 
@@ -91,6 +92,16 @@ const totals = computed(() => ({
   meltFurnaces: store.meltingFurnaces.length,
   annealFurnaces: store.annealingFurnaces.length,
 }))
+
+/** 当前取料扣减方式说明 */
+const consumeModeHint = computed(() => {
+  const opt = CONSUME_MODE_OPTIONS.find((item) => item.value === consumeMode.value)
+  return opt?.hint ?? ''
+})
+
+function handleConsumeModeChange(value: ConsumeMode): void {
+  setConsumeMode(value)
+}
 
 onMounted(() => {
   void store.loadAll()
@@ -280,6 +291,18 @@ function handleFurnaceFilter(key: string, value: string): void {
         </div>
       </template>
     </el-alert>
+
+    <el-card shadow="never" class="mt-14">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">取料扣减方式</span>
+        </div>
+      </template>
+      <el-radio-group :model-value="consumeMode" @change="(v: ConsumeMode) => handleConsumeModeChange(v)">
+        <el-radio v-for="opt in CONSUME_MODE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</el-radio>
+      </el-radio-group>
+      <div class="consume-mode-hint">{{ consumeModeHint }}</div>
+    </el-card>
 
     <el-card shadow="never">
       <template #header>
@@ -612,6 +635,13 @@ function handleFurnaceFilter(key: string, value: string): void {
   margin: 0 0 12px;
   font-size: 13px;
   color: #5b6b7a;
+}
+
+.consume-mode-hint {
+  font-size: 12px;
+  color: #8b95a1;
+  line-height: 1.6;
+  margin-top: 8px;
 }
 
 .mt-14 {
