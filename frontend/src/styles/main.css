@@ -1,0 +1,50 @@
+/* 玻璃吹制工序与退火窑编排台 · 全局样式
+   窑夜深蓝 + 玻璃熔融橙，浅色面板衬托工序与温控数据。 */
+
+:root {
+  --gb-bg: #f4f7fa;
+  --gb-ink: #1d2b3a;
+  --gb-primary: #24405e;
+  --gb-accent: #c2571a;
+  --gb-line: rgba(36, 64, 94, 0.14);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--gb-bg);
+  color: var(--gb-ink);
+  font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Source Han Sans SC', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  position: relative;
+}
+
+.el-table .cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.el-card {
+  border-radius: 10px;
+}
+
+.el-table .row-low-remain td.el-table__cell {
+  background: #fff5f4 !important;
+}
+
+@media (max-width: 900px) {
+  .app-main {
+    padding: 12px;
+  }
+}

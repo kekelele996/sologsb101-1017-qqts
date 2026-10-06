@@ -1,0 +1,28 @@
+{
+  "name": "gbglassblow-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "玻璃吹制工序与退火窑编排台 - 纯前端 SPA（Vue 3 + TypeScript + Element Plus + Vite + Pinia + Vue Router + Dexie）",
+  "scripts": {
+    "dev": "vite --host --port 22817",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview --host --port 22817",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "dexie": "^4.0.11",
+    "element-plus": "^2.9.5",
+    "pinia": "^2.3.1",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.7.3",
+    "vite": "^6.1.0",
+    "vue-tsc": "^2.2.0"
+  }
+}
