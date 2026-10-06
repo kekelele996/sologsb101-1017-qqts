@@ -10,6 +10,7 @@ import type { GlassBatch, GlassBatchDraft } from '../types/batch'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
+  BatchReferenceError,
   consumeBatch,
   countAll,
   db,
@@ -185,7 +186,15 @@ export const useFurnaceStore = defineStore('furnace', () => {
   }
 
   async function deleteFurnace(furnaceId: string): Promise<void> {
-    await removeFurnace(furnaceId)
+    try {
+      await removeFurnace(furnaceId)
+    } catch (err) {
+      if (err instanceof BatchReferenceError) {
+        lastMessage.value = err.message
+        throw err
+      }
+      throw err
+    }
     await refreshCounts()
     revision.value += 1
     lastMessage.value = '窑炉及其料液批次已删除'
@@ -200,6 +209,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
       recipe: draft.recipe.trim(),
       meltDate: draft.meltDate,
       tempC: draft.tempC,
+      initialKg: draft.initialKg,
       remainKg: draft.remainKg,
       createdAt: stamp,
       updatedAt: stamp,
@@ -220,13 +230,22 @@ export const useFurnaceStore = defineStore('furnace', () => {
       recipe: draft.recipe.trim(),
       meltDate: draft.meltDate,
       tempC: draft.tempC,
+      initialKg: draft.initialKg,
       remainKg: draft.remainKg,
     })
     revision.value += 1
   }
 
   async function deleteBatch(batchId: string): Promise<void> {
-    await removeBatch(batchId)
+    try {
+      await removeBatch(batchId)
+    } catch (err) {
+      if (err instanceof BatchReferenceError) {
+        lastMessage.value = err.message
+        throw err
+      }
+      throw err
+    }
     revision.value += 1
   }
 

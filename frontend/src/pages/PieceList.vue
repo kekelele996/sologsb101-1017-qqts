@@ -54,6 +54,33 @@ const batchLabel = computed<Record<string, string>>(() => {
   return result
 })
 
+/** 每件作品的取料工序摘要：已扣减 / 待扣 / 未填 */
+const gatherSummary = computed<Record<string, { tone: 'success' | 'warning' | 'danger' | 'info'; text: string }>>(() => {
+  const result: Record<string, { tone: 'success' | 'warning' | 'danger' | 'info'; text: string }> = {}
+  pieceStore.pieces.forEach((piece) => {
+    const gather = pieceStore.steps.find((row) => row.pieceId === piece.id && row.name === '取料')
+    if (!gather) {
+      result[piece.id] = { tone: 'info', text: '未登记取料' }
+      return
+    }
+    if (gather.consumedKg > 0) {
+      const color = batchColorOf(gather.consumedBatchId)
+      result[piece.id] = { tone: 'success', text: `${color} · 已扣 ${gather.consumedKg} kg` }
+    } else if (gather.state === '已完成') {
+      result[piece.id] = { tone: 'warning', text: '历史取料未计量' }
+    } else if (gather.gatherKg !== null) {
+      result[piece.id] = { tone: 'warning', text: `待扣 ${gather.gatherKg} kg（${gather.state}）` }
+    } else {
+      result[piece.id] = { tone: 'danger', text: '未填取料量' }
+    }
+  })
+  return result
+})
+
+function batchColorOf(batchId: string): string {
+  return furnaceStore.batches.find((row) => row.id === batchId)?.colorCode ?? '（批次已删除）'
+}
+
 const designCheck = computed(() => checkDesign(form.designHeightMm, form.wallThicknessMm))
 
 const stats = computed(() => ({
@@ -219,6 +246,13 @@ function handleFilterChange(key: string, value: string): void {
         </el-table-column>
         <el-table-column label="料液批次" min-width="220">
           <template #default="{ row }">{{ batchLabel[row.batchId] ?? '（批次已删除）' }}</template>
+        </el-table-column>
+        <el-table-column label="取料扣减" min-width="200">
+          <template #default="{ row }">
+            <el-tag :type="gatherSummary[row.id]?.tone ?? 'info'" size="small">
+              {{ gatherSummary[row.id]?.text ?? '未登记取料' }}
+            </el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="设计高度" width="110" align="right">
           <template #default="{ row }">{{ row.designHeightMm }} mm</template>

@@ -15,7 +15,15 @@ import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
 import { buildStepCardText, copyText } from '@/utils/export'
-import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
+import {
+  CRAFT_TEMP_RANGE,
+  LOW_REMAIN_KG,
+  checkStepTemp,
+  estimateGatherKg,
+  formatHours,
+  isLowRemain,
+  totalAnnealHours,
+} from '@/utils/thermal'
 
 const route = useRoute()
 const router = useRouter()
@@ -42,6 +50,7 @@ const form = reactive<StepDraft>({
   operator: '',
   remark: '',
   state: '未开始',
+  gatherKg: null,
 })
 
 const rules: FormRules<StepDraft> = {
@@ -68,6 +77,44 @@ const tempCheck = computed(() =>
     : checkStepTemp(form.tempC, furnace.value?.maxTempC ?? 1250, piece.value.craft)
 )
 
+/** 表单当前是否在编辑取料工序 */
+const formIsGather = computed(() => form.name === '取料')
+
+/** el-input-number 的 modelValue 是 number | undefined，这里与表单的 number | null 互转 */
+const formGatherKgProxy = computed<number | undefined>({
+  get: () => form.gatherKg ?? undefined,
+  set: (value) => {
+    form.gatherKg = value === undefined ? null : value
+  },
+})
+
+/** 按设计高度与壁厚估算的单件取料量（取料表单内可一键预填） */
+const estimatedGatherKg = computed(() =>
+  piece.value === null ? 0 : estimateGatherKg(piece.value.designHeightMm, piece.value.wallThicknessMm, piece.value.craft)
+)
+
+/** 当前作品是否缺失料液批次（批次为空或批次记录已删） */
+const batchMissing = computed(() => piece.value === null || piece.value.batchId === '' || batch.value === undefined)
+
+function applyEstimatedGather(): void {
+  form.gatherKg = estimatedGatherKg.value
+}
+
+/** 取料量是否足够（推进完成 / 保存为已完成前校验） */
+function gatherShortage(gatherKg: number | null): string {
+  if (batchMissing.value) return '该作品尚未挂料液批次（或批次已删除），请先在作品登记中补挂批次'
+  if (gatherKg === null || !(gatherKg > 0)) return '请先填写本次实际取料量（kg），可点「按设计估算」预填后再按实际修改'
+  if (batch.value !== undefined && gatherKg > batch.value.remainKg) {
+    return `批次「${batch.value.colorCode}」剩余 ${batch.value.remainKg} kg，不足本次取料 ${gatherKg} kg，请先补料或改挂批次`
+  }
+  return ''
+}
+
+/** 取料完成时被扣减批次的色号（历史快照批次可能已删） */
+function gatherBatchColor(batchId: string): string {
+  return furnaceStore.batches.find((row) => row.id === batchId)?.colorCode ?? '（批次已删除）'
+}
+
 const currentStep = computed<Step | null>(() => steps.value.find((row) => row.state !== '已完成') ?? null)
 
 onMounted(() => {
@@ -87,6 +134,7 @@ function openCreate(): void {
     operator: currentStep.value?.operator ?? '',
     remark: '',
     state: '未开始' as StepState,
+    gatherKg: null,
   })
   dialogVisible.value = true
 }
@@ -102,6 +150,7 @@ function openEdit(row: Step): void {
     operator: row.operator,
     remark: row.remark,
     state: row.state,
+    gatherKg: row.gatherKg,
   })
   dialogVisible.value = true
 }
@@ -113,24 +162,42 @@ async function handleSubmit(): Promise<void> {
   if (!tempCheck.value.ok) {
     ElMessage.warning(tempCheck.value.message)
   }
+  // 保存为「已完成」的取料工序：必须挂批次、填了实际取料量且余量充足，否则拦下
+  if (form.name === '取料' && form.state === '已完成') {
+    const shortage = gatherShortage(form.gatherKg)
+    if (shortage !== '') {
+      ElMessage.error(shortage)
+      return
+    }
+  }
   submitting.value = true
   try {
+    let settle: { colorCode: string; kg: number; remainKg: number } | null = null
     if (editingId.value === null) {
-      await pieceStore.createStep({ ...form })
+      settle = await pieceStore.createStep({ ...form })
       ElMessage.success(`已新增第 ${form.seq} 道「${form.name}」`)
     } else {
-      await pieceStore.updateStep(editingId.value, { ...form })
+      settle = await pieceStore.updateStep(editingId.value, { ...form })
       ElMessage.success('工序已更新')
     }
+    if (settle !== null) {
+      ElMessage.success(`已按实际取料量扣减：${settle.colorCode} −${settle.kg} kg，剩余 ${settle.remainKg} kg`)
+      if (isLowRemain(settle.remainKg)) {
+        ElMessage.warning(`${settle.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`)
+      }
+    }
     dialogVisible.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '保存工序失败')
   } finally {
     submitting.value = false
   }
 }
 
 async function handleDelete(row: Step): Promise<void> {
+  const refundNote = row.consumedKg > 0 ? `，并把已扣减的 ${row.consumedKg} kg 料液退回批次「${row.consumedBatchId}」` : ''
   try {
-    await ElMessageBox.confirm(`确认删除第 ${row.seq} 道「${row.name}」？`, '删除确认', {
+    await ElMessageBox.confirm(`确认删除第 ${row.seq} 道「${row.name}」？${refundNote}`, '删除确认', {
       type: 'warning',
       confirmButtonText: '删除',
       cancelButtonText: '取消',
@@ -139,12 +206,27 @@ async function handleDelete(row: Step): Promise<void> {
     return
   }
   await pieceStore.deleteStep(row.id)
-  ElMessage.success('工序已删除')
+  ElMessage.success(pieceStore.lastMessage)
 }
 
 async function handleAdvance(row: Step): Promise<void> {
-  await pieceStore.advanceStep(row.id)
-  ElMessage.success(pieceStore.lastMessage)
+  // 推进取料工序到「已完成」前，必须能完成扣减：已挂批次、已填实际取料量、余量充足，否则拦下
+  if (row.name === '取料' && row.state === '进行中') {
+    const shortage = gatherShortage(row.gatherKg)
+    if (shortage !== '') {
+      ElMessage.error(shortage)
+      return
+    }
+  }
+  try {
+    const settle = await pieceStore.advanceStep(row.id)
+    ElMessage.success(pieceStore.lastMessage)
+    if (settle !== null && isLowRemain(settle.remainKg)) {
+      ElMessage.warning(`${settle.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`)
+    }
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '工序推进失败')
+  }
 }
 
 async function handleDrop(targetId: string): Promise<void> {
@@ -158,7 +240,7 @@ async function handleDrop(targetId: string): Promise<void> {
 
 async function handleCopyCard(): Promise<void> {
   if (piece.value === null) return
-  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [])
+  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [], furnaceStore.batches)
   const ok = await copyText(text)
   ElMessage[ok ? 'success' : 'warning'](ok ? '工序卡片已复制到剪贴板' : '当前浏览器不支持剪贴板写入')
 }
@@ -184,7 +266,10 @@ function goAnnealing(): void {
         <el-space wrap>
           <StageTag v-if="piece" :stage="piece.state" :craft="piece.craft" />
           <el-tag v-if="furnace" type="info">{{ furnace.code }} · 上限 {{ furnace.maxTempC }} ℃</el-tag>
-          <el-tag v-if="batch" type="success">{{ batch.colorCode }} · 余 {{ batch.remainKg }} kg</el-tag>
+          <el-tag v-if="batch" :type="isLowRemain(batch.remainKg) ? 'danger' : 'success'">
+            {{ batch.colorCode }} · 余 {{ batch.remainKg }} kg
+          </el-tag>
+          <el-tag v-else-if="piece" type="danger">未挂料液批次</el-tag>
           <el-tag v-if="piece" type="warning">理论退火 {{ formatHours(totalAnnealHours(piece.wallThicknessMm)) }}</el-tag>
         </el-space>
       </template>
@@ -204,6 +289,22 @@ function goAnnealing(): void {
     </EmptyPanel>
 
     <template v-else>
+      <el-alert
+        v-if="batchMissing"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mt-14"
+        title="该作品没有挂可用的料液批次，取料工序无法扣减"
+      >
+        <template #default>
+          <div class="alert-action">
+            <span>请先返回作品登记，为作品选择一个现存料液批次；否则推进「取料」到已完成时会被拦下。</span>
+            <el-button size="small" type="primary" @click="router.push('/pieces')">去补挂批次</el-button>
+          </div>
+        </template>
+      </el-alert>
+
       <div class="stat-row">
         <StatBadge label="工序总数" :value="progress.total" suffix="道" tone="primary" icon="Histogram" />
         <StatBadge label="已完成" :value="progress.done" suffix="道" tone="success" icon="DataLine" />
@@ -294,6 +395,15 @@ function goAnnealing(): void {
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
               </div>
               <div class="step-sub">
+                <template v-if="row.name === '取料'">
+                  <el-tag size="small" :type="row.consumedKg > 0 ? 'success' : row.gatherKg !== null ? 'warning' : 'danger'">
+                    <template v-if="row.consumedKg > 0">已扣 {{ row.consumedKg }} kg</template>
+                    <template v-else-if="row.gatherKg !== null">待扣 {{ row.gatherKg }} kg</template>
+                    <template v-else>未填取料量</template>
+                  </el-tag>
+                  <span v-if="row.consumedKg > 0"> · 完成时从 {{ gatherBatchColor(row.consumedBatchId) }} 扣减 · </span>
+                  <span v-else-if="batch"> · 批次 {{ batch.colorCode }} 余 {{ batch.remainKg }} kg · </span>
+                </template>
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
               </div>
@@ -304,6 +414,7 @@ function goAnnealing(): void {
                 type="primary"
                 plain
                 :disabled="row.state === '已完成'"
+                :title="row.name === '取料' && row.state === '进行中' ? gatherShortage(row.gatherKg) : ''"
                 @click="handleAdvance(row)"
               >
                 推进状态
@@ -356,6 +467,39 @@ function goAnnealing(): void {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-form-item v-if="formIsGather" label="实际取料量">
+          <div class="gather-row">
+            <el-input-number
+              v-model="formGatherKgProxy"
+              :min="0.1"
+              :max="500"
+              :step="0.1"
+              :precision="1"
+              placeholder="kg"
+              style="width: 180px"
+            />
+            <el-button size="small" plain @click="applyEstimatedGather">
+              按设计估算 {{ estimatedGatherKg }} kg
+            </el-button>
+            <el-tag v-if="batch" :type="isLowRemain(batch.remainKg) ? 'danger' : 'info'" size="small">
+              {{ batch.colorCode }} 剩余 {{ batch.remainKg }} kg
+            </el-tag>
+            <el-tag v-else type="danger" size="small">作品未挂批次</el-tag>
+          </div>
+        </el-form-item>
+        <el-alert
+          v-if="formIsGather"
+          :type="form.state === '已完成' ? 'warning' : 'info'"
+          show-icon
+          :closable="false"
+          class="mb-12"
+          :title="
+            form.state === '已完成'
+              ? '保存为已完成将立即按实际取料量扣减批次剩余量（余量不足或未填取料量会被拦下）。'
+              : '实际取料量可先填或稍后补；只有推进到「已完成」的那一刻才会扣减批次剩余量。'
+          "
+          description="估算值按外径≈设计高度/3 的空心回转体体积 × 玻璃密度 2500 kg/m³ × 工艺挑料系数计算，仅作预填参考，请按实际挑料量修改。"
+        />
         <el-form-item label="备注">
           <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="如：分三次吹气成型 / 夹持颈部收细" />
         </el-form-item>
@@ -474,11 +618,31 @@ function goAnnealing(): void {
   flex-wrap: wrap;
 }
 
+.alert-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.gather-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
 .mt-14 {
   margin-top: 14px;
 }
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
 }
 </style>

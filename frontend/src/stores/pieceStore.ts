@@ -14,11 +14,13 @@ import {
   db,
   initDatabase,
   putPiece,
-  putStep,
   removePiece,
   removeStep,
   reorderSteps,
+  saveStep,
+  advanceStepState,
   syncPieceState,
+  type GatherSettle,
 } from '../utils/db'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
 import { nowIso, uuid } from '../utils/id'
@@ -193,7 +195,7 @@ export const usePieceStore = defineStore('piece', () => {
 
   /* ------------------------------ 工序 ------------------------------ */
 
-  async function createStep(draft: StepDraft): Promise<Step> {
+  async function createStep(draft: StepDraft): Promise<GatherSettle | null> {
     const stamp = nowIso()
     const row: Step = {
       id: uuid('step'),
@@ -205,19 +207,23 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      gatherKg: draft.name === '取料' ? draft.gatherKg : null,
+      consumedBatchId: '',
+      consumedKg: 0,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
     }
-    await putStep(row)
+    const { settle } = await saveStep(row)
     revision.value += 1
-    return row
+    if (settle === null) lastMessage.value = `已新增第 ${draft.seq} 道「${draft.name}」`
+    return settle
   }
 
-  async function updateStep(stepId: string, draft: StepDraft): Promise<void> {
+  async function updateStep(stepId: string, draft: StepDraft): Promise<GatherSettle | null> {
     const existing = steps.value.find((row) => row.id === stepId)
-    if (existing === undefined) return
-    await putStep({
+    if (existing === undefined) return null
+    const { settle } = await saveStep({
       ...existing,
       seq: draft.seq,
       name: draft.name,
@@ -226,33 +232,39 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      gatherKg: draft.name === '取料' ? draft.gatherKg : null,
     })
     revision.value += 1
+    if (settle === null) lastMessage.value = '工序已更新'
+    return settle
   }
 
   async function deleteStep(stepId: string): Promise<void> {
+    const existing = steps.value.find((row) => row.id === stepId)
     await removeStep(stepId)
     revision.value += 1
-    lastMessage.value = '工序已删除，作品状态已重新推导'
+    lastMessage.value =
+      existing?.consumedKg && existing.consumedKg > 0
+        ? `工序已删除，已把取料扣减的 ${existing.consumedKg} kg 退回原批次`
+        : '工序已删除，作品状态已重新推导'
   }
 
-  /** 推进工序状态：未开始 → 进行中 → 已完成 */
-  async function advanceStep(stepId: string): Promise<void> {
+  /** 推进工序状态：未开始 → 进行中 → 已完成；取料工序完成时按填报量扣减批次 */
+  async function advanceStep(stepId: string, gatherKg?: number): Promise<GatherSettle | null> {
     const existing = steps.value.find((row) => row.id === stepId)
-    if (existing === undefined) return
-    const flow: Step['state'][] = ['未开始', '进行中', '已完成']
-    const index = flow.indexOf(existing.state)
-    if (index < 0 || index >= flow.length - 1) {
-      lastMessage.value = '该工序已处于「已完成」状态'
-      return
-    }
-    const next = flow[index + 1]
-    await putStep({ ...existing, state: next })
+    if (existing === undefined) return null
+    const result = await advanceStepState(stepId, gatherKg)
+    if (result === null) return null
     revision.value += 1
     const piece = pieces.value.find((row) => row.id === existing.pieceId)
-    lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已推进为「${next}」${
-      piece === undefined ? '' : `（作品：${piece.name}）`
-    }`
+    if (result.settle !== null) {
+      lastMessage.value = `第 ${existing.seq} 道「取料」完成：${result.settle.colorCode} 扣减 ${result.settle.kg} kg，剩余 ${result.settle.remainKg} kg${piece === undefined ? '' : `（作品：${piece.name}）`}`
+    } else {
+      lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已推进为「${result.next}」${
+        piece === undefined ? '' : `（作品：${piece.name}）`
+      }`
+    }
+    return result.settle
   }
 
   /** 拖拽排序：把 fromId 移动到 toId 之前 */

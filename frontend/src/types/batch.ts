@@ -14,6 +14,8 @@ export interface GlassBatch {
   meltDate: string
   /** 出料温度（℃） */
   tempC: number
+  /** 登记时的初始量（kg），用于累计已用量展示；登记后作为台账基准不随取料变化 */
+  initialKg: number
   /** 剩余量（kg） */
   remainKg: number
   createdAt: string
@@ -28,5 +30,6 @@ export interface GlassBatchDraft {
   recipe: string
   meltDate: string
   tempC: number
+  initialKg: number
   remainKg: number
 }

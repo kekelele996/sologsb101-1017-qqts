@@ -219,3 +219,46 @@ export const LOW_REMAIN_KG = 60
 export function isLowRemain(remainKg: number): boolean {
   return remainKg < LOW_REMAIN_KG
 }
+
+/** 熔融钠钙玻璃密度（kg/m³ = 2.5 g/cm³） */
+export const MOLTEN_GLASS_DENSITY = 2500
+
+/** 作品外径相对设计高度的比例（回转体口径约为高度的 1/2） */
+export const PIECE_DIAMETER_HEIGHT_RATIO = 1 / 2
+
+/** 每次取料的固定料头 / 挑料杆余料（kg，小件也有的打底损耗） */
+export const GATHER_BASE_OVERHEAD_KG = 1
+
+/**
+ * 各工艺的挑料倍数（成品壳体质量 → 实际取料量）：
+ * 手工吹制需多次挑料、回炉且料头占比高；铸造为实腔浇注还有浇道损耗；灯工介于其间。
+ * 倍数按工作室历史取料记录（小件 2–3 kg、大件 6–10 kg）标定。
+ */
+export const GATHER_CRAFT_FACTOR: Record<Craft, number> = {
+  吹制: 8,
+  铸造: 18,
+  热塑: 12,
+}
+
+/** 取料量估算下限（kg），避免小件算出 0 */
+export const MIN_GATHER_KG = 0.3
+
+/**
+ * 按设计高度与壁厚估算单件取料量（kg），仅作为取料工序的预填参考。
+ *
+ * 把成品近似为外径 = 高 × 1/2、壁厚 t 的空心回转体：
+ *   成品壳体体积 ≈ π × 外半径 × 壁厚 × 高（薄壁近似）
+ *   实际取料 = 固定料头 + 壳体体积 × 玻璃密度(2500 kg/m³) × 工艺挑料倍数
+ *
+ * 挑料倍数已含多次挑料、回炉与料头损耗；操作工应按实际挑料量填报，扣减以填报值为准。
+ * 结果保留 1 位小数且不低于 0.3 kg。
+ */
+export function estimateGatherKg(designHeightMm: number, wallThicknessMm: number, craft: Craft): number {
+  const heightM = Math.max(0, designHeightMm) / 1000
+  const wallM = Math.max(0, wallThicknessMm) / 1000
+  const radiusM = (heightM * PIECE_DIAMETER_HEIGHT_RATIO) / 2
+  const shellVolumeM3 = Math.PI * radiusM * wallM * heightM
+  const kg =
+    GATHER_BASE_OVERHEAD_KG + shellVolumeM3 * MOLTEN_GLASS_DENSITY * GATHER_CRAFT_FACTOR[craft]
+  return Math.max(MIN_GATHER_KG, round1(kg))
+}

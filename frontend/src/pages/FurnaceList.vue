@@ -54,6 +54,7 @@ const batchForm = reactive<GlassBatchDraft>({
   recipe: '',
   meltDate: today(),
   tempC: 1150,
+  initialKg: 200,
   remainKg: 200,
 })
 
@@ -71,6 +72,7 @@ const batchRules: FormRules<GlassBatchDraft> = {
   recipe: [{ required: true, message: '请填写配方', trigger: 'blur' }],
   meltDate: [{ required: true, message: '请选择熔化日期', trigger: 'change' }],
   tempC: [{ required: true, message: '请填写出料温度', trigger: 'blur' }],
+  initialKg: [{ required: true, message: '请填写初始量', trigger: 'blur' }],
   remainKg: [{ required: true, message: '请填写剩余量', trigger: 'blur' }],
 }
 
@@ -149,8 +151,12 @@ async function deleteFurnace(row: Furnace): Promise<void> {
   } catch {
     return
   }
-  await store.deleteFurnace(row.id)
-  ElMessage.success('窑炉已删除')
+  try {
+    await store.deleteFurnace(row.id)
+    ElMessage.success('窑炉已删除')
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '删除窑炉失败')
+  }
 }
 
 function openCreateBatch(): void {
@@ -161,6 +167,7 @@ function openCreateBatch(): void {
     recipe: '',
     meltDate: today(),
     tempC: 1150,
+    initialKg: 200,
     remainKg: 200,
   })
   batchDialog.value = true
@@ -174,6 +181,7 @@ function openEditBatch(row: GlassBatch): void {
     recipe: row.recipe,
     meltDate: row.meltDate,
     tempC: row.tempC,
+    initialKg: row.initialKg,
     remainKg: row.remainKg,
   })
   batchDialog.value = true
@@ -208,8 +216,17 @@ async function deleteBatch(row: GlassBatch): Promise<void> {
   } catch {
     return
   }
-  await store.deleteBatch(row.id)
-  ElMessage.success('料液批次已删除')
+  try {
+    await store.deleteBatch(row.id)
+    ElMessage.success('料液批次已删除')
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '删除料液批次失败')
+  }
+}
+
+/** 已用量 = 初始量 - 剩余量（含作品取料与手工取料等全部扣减） */
+function usedKgOf(row: GlassBatch): number {
+  return Math.round((row.initialKg - row.remainKg) * 10) / 10
 }
 
 function openConsume(row: GlassBatch): void {
@@ -412,6 +429,14 @@ function handleFurnaceFilter(key: string, value: string): void {
         <el-table-column label="出料温度" width="110" align="right">
           <template #default="{ row }">{{ row.tempC }} ℃</template>
         </el-table-column>
+        <el-table-column label="初始量" width="100" align="right">
+          <template #default="{ row }">{{ row.initialKg }} kg</template>
+        </el-table-column>
+        <el-table-column label="已用量" width="100" align="right">
+          <template #default="{ row }">
+            <span :class="{ 'cell-warn': usedKgOf(row) > 0 }">{{ usedKgOf(row) }} kg</span>
+          </template>
+        </el-table-column>
         <el-table-column label="剩余量" width="130" align="right">
           <template #default="{ row }">
             <el-tag :type="isLowRemain(row.remainKg) ? 'danger' : 'success'" size="small">
@@ -514,17 +539,29 @@ function handleFurnaceFilter(key: string, value: string): void {
           <el-input v-model="batchForm.recipe" type="textarea" :rows="2" placeholder="如：钠钙玻璃基础料 + 氧化钴 0.3%" />
         </el-form-item>
         <el-row :gutter="12">
-          <el-col :span="12">
+          <el-col :span="8">
             <el-form-item label="出料温度（℃）" prop="tempC">
               <el-input-number v-model="batchForm.tempC" :min="600" :max="1800" :step="10" style="width: 100%" />
             </el-form-item>
           </el-col>
-          <el-col :span="12">
+          <el-col :span="8">
+            <el-form-item label="初始量（kg）" prop="initialKg">
+              <el-input-number v-model="batchForm.initialKg" :min="0" :max="5000" :step="10" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
             <el-form-item label="剩余量（kg）" prop="remainKg">
               <el-input-number v-model="batchForm.remainKg" :min="0" :max="5000" :step="10" style="width: 100%" />
             </el-form-item>
           </el-col>
         </el-row>
+        <el-alert
+          type="info"
+          show-icon
+          :closable="false"
+          class="mb-12"
+          title="初始量是这批料登记时的台账基准；作品在「取料」工序完成时会自动从剩余量扣减，已用量 = 初始量 − 剩余量。"
+        />
         <el-alert
           v-if="isLowRemain(batchForm.remainKg)"
           type="warning"
@@ -539,10 +576,11 @@ function handleFurnaceFilter(key: string, value: string): void {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="consumeDialog" title="取料" width="460px">
+    <el-dialog v-model="consumeDialog" title="手工取料（盘点调整）" width="460px">
       <p class="dialog-tip">
         {{ consumeTarget?.colorCode }} 当前剩余
-        <b>{{ consumeTarget?.remainKg }} kg</b>，取料后按剩余量扣减；不足时扣到 0。
+        <b>{{ consumeTarget?.remainKg }} kg</b>。此处为不绑定作品的手工盘点取料，按剩余量扣减、不足时扣到
+        0；作品用料请在其「取料」工序里按实际取料量扣减（余量不足会拦下）。
       </p>
       <el-form label-width="110px">
         <el-form-item label="取料量（kg）">
@@ -620,5 +658,9 @@ function handleFurnaceFilter(key: string, value: string): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
 }
 </style>

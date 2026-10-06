@@ -5,24 +5,25 @@
  * - 提供各表增删改查、作品状态联动、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
-import Dexie, { type Table } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
 import type { Furnace } from '../types/furnace'
 import type { GlassBatch } from '../types/batch'
 import type { Piece, PieceState } from '../types/piece'
-import type { Step } from '../types/step'
+import type { Step, StepState } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
+import { round1 } from './thermal'
 
 /** 数据库名 */
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -93,6 +94,33 @@ class GlassBlowDatabase extends Dexie {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
         })
       })
+
+    // ---------- v3：料液批次登记初始量；取料工序记录实际取料量与扣减快照 ----------
+    // 索引不变（新字段均非索引），只需声明完整表结构并在 upgrade 中回填字段
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 1：料液批次补齐初始量（历史批次以当前剩余量作为台账基准，不追补已用量）
+        await tx.table('batches').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.initialKg !== 'number' || Number.isNaN(row.initialKg)) {
+            row.initialKg = typeof row.remainKg === 'number' ? row.remainKg : 0
+          }
+        })
+        // 迁移 2：工序补齐取料计量与扣减快照字段。
+        // 历史已完成取料视为「未计量」：不追溯扣减批次剩余量，只在作品侧展示未计量。
+        await tx.table('steps').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.gatherKg !== 'number') row.gatherKg = null
+          if (typeof row.consumedBatchId !== 'string') row.consumedBatchId = ''
+          if (typeof row.consumedKg !== 'number') row.consumedKg = 0
+        })
+      })
   }
 }
 
@@ -130,9 +158,24 @@ export async function putFurnace(row: Furnace): Promise<void> {
   await db.furnaces.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
 }
 
-/** 删除窑炉：级联清理该窑下的料液批次 */
+/** 窑炉下是否还有作品通过料液批次引用它（删除保护用） */
+export class BatchReferenceError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BatchReferenceError'
+  }
+}
+
+/** 删除窑炉：级联清理其料液批次；批次仍被作品引用时拒绝删除 */
 export async function removeFurnace(id: string): Promise<void> {
-  await db.transaction('rw', db.furnaces, db.batches, async () => {
+  await db.transaction('rw', db.furnaces, db.batches, db.pieces, async () => {
+    const batchIds = (await db.batches.where('furnaceId').equals(id).toArray()).map((row) => row.id)
+    if (batchIds.length > 0) {
+      const referenced = await db.pieces.where('batchId').anyOf(batchIds).count()
+      if (referenced > 0) {
+        throw new BatchReferenceError(`该窑炉下还有 ${referenced} 件作品引用其料液批次，请先改挂或删除相关作品`)
+      }
+    }
     await db.batches.where('furnaceId').equals(id).delete()
     await db.furnaces.delete(id)
   })
@@ -149,7 +192,15 @@ export async function putBatch(row: GlassBatch): Promise<void> {
   await db.batches.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
 }
 
+/** 删除料液批次：仍被作品引用时拒绝，避免作品失去批次后取料无法扣减 */
 export async function removeBatch(id: string): Promise<void> {
+  const referenced = await db.pieces.where('batchId').equals(id).count()
+  if (referenced > 0) {
+    const batch = await db.batches.get(id)
+    throw new BatchReferenceError(
+      `料液批次「${batch?.colorCode ?? id}」仍被 ${referenced} 件作品引用，请先把这些作品改挂到其他批次`,
+    )
+  }
   await db.batches.delete(id)
 }
 
@@ -219,16 +270,172 @@ export async function listStepsByPiece(pieceId: string): Promise<Step[]> {
   return rows.sort((a, b) => a.seq - b.seq)
 }
 
-export async function putStep(row: Step): Promise<void> {
-  await db.steps.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
-  await syncPieceState(row.pieceId)
+/** 取料扣减结算结果 */
+export interface GatherSettle {
+  /** 被扣减的批次 id */
+  batchId: string
+  /** 批次色号（提示文案用） */
+  colorCode: string
+  /** 实际扣减量（kg） */
+  kg: number
+  /** 扣减后的批次剩余量（kg） */
+  remainKg: number
 }
 
+/** 工序保存结果：仅当本次写入触发了取料扣减时有值 */
+export interface SaveStepResult {
+  settle: GatherSettle | null
+}
+
+/** 事务内推导并回写作品状态（规则同 syncPieceState） */
+async function resyncPieceStateInTx(tx: Transaction, pieceId: string): Promise<PieceState> {
+  const [piece, stepRows, annealRows, inspectRows] = await Promise.all([
+    tx.table<Piece, string>('pieces').get(pieceId),
+    tx.table<Step, string>('steps').where('pieceId').equals(pieceId).toArray(),
+    tx.table<Anneal, string>('anneals').where('pieceId').equals(pieceId).toArray(),
+    tx.table<Inspect, string>('inspects').where('pieceId').equals(pieceId).toArray(),
+  ])
+  let next: PieceState = '设计中'
+  if (stepRows.length > 0) next = '制作中'
+  if (annealRows.some((row) => row.state === '已出炉')) next = '已退火'
+  if (inspectRows.length > 0) next = '已检验'
+  if (piece && next !== piece.state) {
+    await tx.table<Piece, string>('pieces').update(pieceId, { state: next, updatedAt: nowIso() })
+  }
+  return next
+}
+
+/** 取料扣减校验失败（未挂批次 / 批次缺失 / 未填报取料量 / 余量不足） */
+export class GatherRequirementError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'GatherRequirementError'
+  }
+}
+
+/**
+ * 保存工序（新建 / 编辑），并在同一事务内结算「取料」工序的料液扣减：
+ * - 仅当工序名为「取料」且状态为「已完成」时产生扣减；
+ * - 旧记录若已扣减，先把料退回原批次快照（回退状态、改名、删除均走这条回退路径）；
+ * - 新记录按作品当前挂的批次扣减填报取料量；未挂批次、批次已删、未填报或余量不足均拦下；
+ * - 扣减量与批次 id 快照写在工序上，作品事后改挂批次不影响历史账。
+ */
+export async function saveStep(input: Step): Promise<SaveStepResult> {
+  let settle: GatherSettle | null = null
+  await db.transaction(
+    'rw',
+    db.steps,
+    db.pieces,
+    db.batches,
+    db.anneals,
+    db.inspects,
+    async (tx) => {
+      const old = await tx.table<Step, string>('steps').get(input.id)
+
+      // 1) 回退旧记录已发生的扣减（退回扣减时记录的批次；批次已删则无法退回，跳过）
+      if (old && old.consumedBatchId !== '' && old.consumedKg > 0) {
+        const oldBatch = await tx.table<GlassBatch, string>('batches').get(old.consumedBatchId)
+        if (oldBatch) {
+          await tx.table<GlassBatch, string>('batches').update(oldBatch.id, {
+            remainKg: round1(oldBatch.remainKg + old.consumedKg),
+            updatedAt: nowIso(),
+          })
+        }
+      }
+
+      let consumedBatchId = ''
+      let consumedKg = 0
+
+      // 2) 新记录若为已完成的取料工序，按作品所挂批次扣减
+      if (input.name === '取料' && input.state === '已完成') {
+        const piece = await tx.table<Piece, string>('pieces').get(input.pieceId)
+        if (!piece || piece.batchId === '') {
+          throw new GatherRequirementError('该作品尚未挂料液批次，请先在作品登记中补挂批次，再完成取料工序')
+        }
+        const batch = await tx.table<GlassBatch, string>('batches').get(piece.batchId)
+        if (!batch) {
+          throw new GatherRequirementError('作品所挂的料液批次已不存在，请先在作品登记中改挂现存批次，再完成取料工序')
+        }
+        const kg = input.gatherKg === null ? 0 : round1(input.gatherKg)
+        if (!(kg > 0)) {
+          throw new GatherRequirementError('请先在取料工序中填写本次实际取料量（kg），再推进到已完成')
+        }
+        if (kg > batch.remainKg) {
+          throw new GatherRequirementError(
+            `批次「${batch.colorCode}」剩余 ${batch.remainKg} kg，不足本次取料 ${kg} kg，请补料或改挂批次`,
+          )
+        }
+        const remainKg = round1(batch.remainKg - kg)
+        await tx.table<GlassBatch, string>('batches').update(batch.id, {
+          remainKg,
+          updatedAt: nowIso(),
+        })
+        consumedBatchId = batch.id
+        consumedKg = kg
+        settle = { batchId: batch.id, colorCode: batch.colorCode, kg, remainKg }
+      }
+
+      const next: Step = {
+        ...input,
+        gatherKg: input.name === '取料' ? input.gatherKg : null,
+        consumedBatchId,
+        consumedKg,
+        updatedAt: nowIso(),
+        revision: ROW_REVISION,
+      }
+      await tx.table<Step, string>('steps').put(next)
+      await resyncPieceStateInTx(tx, input.pieceId)
+    },
+  )
+  return { settle }
+}
+
+/** 删除工序：若为已扣减的取料工序，在同一事务内把料退回原批次 */
 export async function removeStep(id: string): Promise<void> {
-  const step = await db.steps.get(id)
-  if (!step) return
-  await db.steps.delete(id)
-  await syncPieceState(step.pieceId)
+  await db.transaction('rw', db.steps, db.pieces, db.batches, db.anneals, db.inspects, async (tx) => {
+    const step = await tx.table<Step, string>('steps').get(id)
+    if (!step) return
+    if (step.consumedBatchId !== '' && step.consumedKg > 0) {
+      const batch = await tx.table<GlassBatch, string>('batches').get(step.consumedBatchId)
+      if (batch) {
+        await tx.table<GlassBatch, string>('batches').update(batch.id, {
+          remainKg: round1(batch.remainKg + step.consumedKg),
+          updatedAt: nowIso(),
+        })
+      }
+    }
+    await tx.table<Step, string>('steps').delete(id)
+    await resyncPieceStateInTx(tx, step.pieceId)
+  })
+}
+
+/** 推进工序状态结果 */
+export interface AdvanceStepResult {
+  step: Step
+  next: StepState
+  settle: GatherSettle | null
+}
+
+/**
+ * 推进工序状态：未开始 → 进行中 → 已完成。
+ * 推进「取料」到已完成时校验取料量并扣减；可传入 gatherKg 完成「填报即推进」。
+ */
+export async function advanceStepState(
+  stepId: string,
+  gatherKgOverride?: number,
+): Promise<AdvanceStepResult | null> {
+  const existing = await db.steps.get(stepId)
+  if (!existing) return null
+  const flow: StepState[] = ['未开始', '进行中', '已完成']
+  const index = flow.indexOf(existing.state)
+  if (index < 0 || index >= flow.length - 1) {
+    return { step: existing, next: existing.state, settle: null }
+  }
+  const next = flow[index + 1]
+  const gatherKg =
+    existing.name === '取料' && gatherKgOverride !== undefined ? round1(gatherKgOverride) : existing.gatherKg
+  const { settle } = await saveStep({ ...existing, state: next, gatherKg })
+  return { step: { ...existing, state: next, gatherKg }, next, settle }
 }
 
 /** 按给定 id 顺序重写工序序号（拖拽排序后调用） */
@@ -332,9 +539,24 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       db.inspects.clear(),
     ])
     await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
+    await db.batches.bulkPut(
+      snapshot.batches.map((row) => ({
+        ...row,
+        // 兼容 v2 存档：缺初始量时以剩余量为基准
+        initialKg: typeof row.initialKg === 'number' ? row.initialKg : row.remainKg,
+        revision: ROW_REVISION,
+      })),
+    )
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
+    await db.steps.bulkPut(
+      snapshot.steps.map((row) => ({
+        ...row,
+        gatherKg: typeof row.gatherKg === 'number' ? row.gatherKg : null,
+        consumedBatchId: typeof row.consumedBatchId === 'string' ? row.consumedBatchId : '',
+        consumedKg: typeof row.consumedKg === 'number' ? row.consumedKg : 0,
+        revision: ROW_REVISION,
+      })),
+    )
     await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })

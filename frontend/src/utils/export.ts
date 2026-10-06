@@ -92,7 +92,9 @@ export function buildScheduleCsv(
     '状态',
     '设计高度(mm)',
     '壁厚(mm)',
-    '料液色号',
+    '登记料液色号',
+    '取料批次色号',
+    '实际取料量(kg)',
     '所属窑炉',
     '工序数',
     '已完成工序',
@@ -109,6 +111,16 @@ export function buildScheduleCsv(
     const batch = batches.find((row) => row.id === piece.batchId)
     const furnace = furnaces.find((row) => row.id === batch?.furnaceId)
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
+    const gather = pieceSteps.find((row) => row.name === '取料')
+    const gatherBatch = gather?.consumedBatchId ? batches.find((row) => row.id === gather.consumedBatchId) : undefined
+    const gatherBatchLabel = gather
+          ? gather.consumedKg
+            ? gatherBatch?.colorCode ?? '（批次已删除）'
+            : gather.gatherKg !== null
+              ? `待扣（${gather.state}）`
+              : '未计量'
+          : '未登记取料'
+    const gatherKgLabel = gather ? (gather.consumedKg ? gather.consumedKg : gather.gatherKg ?? '—') : '—'
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
@@ -122,6 +134,8 @@ export function buildScheduleCsv(
         piece.designHeightMm,
         piece.wallThicknessMm,
         batch?.colorCode ?? '—',
+        gatherBatchLabel,
+        gatherKgLabel,
         furnace?.code ?? '—',
         pieceSteps.length,
         pieceSteps.filter((row) => row.state === '已完成').length,
@@ -174,6 +188,7 @@ export function buildStepCardText(
   furnace: Furnace | undefined,
   steps: Step[],
   anneals: Anneal[],
+  batches: GlassBatch[] = [],
 ): string {
   const lines: string[] = []
   lines.push(`【工序卡片】${piece.name}（${piece.craft} · ${piece.artist} · ${piece.state}）`)
@@ -191,10 +206,21 @@ export function buildStepCardText(
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .forEach((row) => {
+      let gatherNote = ''
+      if (row.name === '取料') {
+        if (row.consumedKg > 0) {
+          const color = batches.find((item: GlassBatch) => item.id === row.consumedBatchId)?.colorCode ?? '（批次已删除）'
+          gatherNote = ` · 实际取料 ${row.consumedKg} kg（已从 ${color} 扣减）`
+        } else if (row.gatherKg !== null) {
+          gatherNote = ` · 实际取料 ${row.gatherKg} kg（待完成扣减）`
+        } else {
+          gatherNote = ' · 实际取料量未填'
+        }
+      }
       lines.push(
         `  ${row.seq}. ${row.name} · ${row.tempC} ℃ · ${row.durationMin} 分钟 · ${row.operator} · ${
           row.state
-        }${row.remark === '' ? '' : ` · ${row.remark}`}`,
+        }${gatherNote}${row.remark === '' ? '' : ` · ${row.remark}`}`,
       )
     })
   if (anneals.length > 0) {
